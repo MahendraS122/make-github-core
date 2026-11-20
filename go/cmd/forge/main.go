@@ -35,6 +35,8 @@ type repository struct {
 	guard                            sync.RWMutex
 	id                               int64
 	owner, name, branch, description string
+	urlBase, issueBase, htmlBase     string
+	urlSafe                          bool
 	private, hasIssues               bool
 	objects                          objects
 	refs                             map[string]string
@@ -65,6 +67,9 @@ func newForge(token, seed, now, login string) *forge {
 	f.viewerJSON, _ = json.Marshal(user(login))
 	return f
 }
+
+var jsonContentType = []string{"application/json"}
+
 func jsonReply(out http.ResponseWriter, status int, value any) {
 	data, err := json.Marshal(value)
 	if err != nil {
@@ -74,8 +79,8 @@ func jsonReply(out http.ResponseWriter, status int, value any) {
 	jsonBytes(out, status, data)
 }
 func jsonBytes(out http.ResponseWriter, status int, data []byte) {
-	out.Header().Set("Content-Type", "application/json")
-	out.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	out.Header()["Content-Type"] = jsonContentType
+	out.Header()["Content-Length"] = []string{strconv.Itoa(len(data))}
 	out.WriteHeader(status)
 	out.Write(data)
 }

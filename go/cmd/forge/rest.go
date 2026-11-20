@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 type fault struct {
@@ -36,7 +37,7 @@ func decode(req *http.Request) (record, bool) {
 	err = json.Unmarshal(data, &input)
 	return input, err == nil && input != nil
 }
-func repoURL(repo *repository) string   { return "/api/v3/repos/" + repo.owner + "/" + repo.name }
+func repoURL(repo *repository) string   { return repo.urlBase }
 func node(kind string, id int64) string { return kind + "_" + strconv.FormatInt(id, 10) }
 func user(login string) record {
 	return record{"login": login, "id": 1000, "node_id": "User_1000", "type": "User", "site_admin": false, "url": "/api/v3/users/" + login, "html_url": "/" + login, "avatar_url": ""}
@@ -81,6 +82,16 @@ func (f *forge) createRepo(owner string, input record) (*repository, *fault) {
 		return nil, fail(422, "Repository already exists")
 	}
 	repo := &repository{id: f.ids.Add(1), owner: owner, name: name, branch: "main", description: str(input, "description"), private: boolean(input, "private", false), hasIssues: boolean(input, "has_issues", true), objects: objects{}, refs: map[string]string{}, issues: map[int]*issue{}, pulls: map[int]*pull{}, labels: map[string]record{}}
+	repo.urlBase = "/api/v3/repos/" + owner + "/" + name
+	repo.issueBase = repo.urlBase + "/issues/"
+	repo.htmlBase = "/" + owner + "/" + name + "/issues/"
+	repo.urlSafe = true
+	for _, char := range repo.urlBase + repo.htmlBase {
+		if char < 32 || char == '"' || char == '\\' || char == '<' || char == '>' || char == '&' || char >= utf8.RuneSelf {
+			repo.urlSafe = false
+			break
+		}
+	}
 	if boolean(input, "auto_init", false) {
 		blob := repo.objects.put(3, []byte("# "+name+"\n"))
 		tree := repo.objects.makeTree(map[string]treeEntry{"README.md": {"100644", "README.md", blob}})

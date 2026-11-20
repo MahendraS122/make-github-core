@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -101,13 +102,11 @@ func (f *forge) cacheIssue(repo *repository, item *issue) {
 		repo.cacheOpenIssues()
 	}
 	repo.issueLists.Clear()
-	number := strconv.Itoa(item.number)
-	repositoryURL := repoURL(repo)
-	issueURL := repositoryURL + "/issues/" + number
-	data := make([]byte, 0, 1024+len(item.title)+len(item.body)+len(repositoryURL)*5)
+	data := make([]byte, 0, 1024+len(item.title)+len(item.body))
 	data = strconv.AppendInt(append(data, `{"id":`...), item.id, 10)
-	data = append(data, `,"node_id":`...)
-	data = appendJSONString(data, node("Issue", item.id))
+	data = append(data, `,"node_id":"Issue_`...)
+	data = strconv.AppendInt(data, item.id, 10)
+	data = append(data, '"')
 	data = strconv.AppendInt(append(data, `,"number":`...), int64(item.number), 10)
 	data = appendJSONString(append(data, `,"title":`...), item.title)
 	data = appendJSONString(append(data, `,"body":`...), item.body)
@@ -130,11 +129,34 @@ func (f *forge) cacheIssue(repo *repository, item *issue) {
 	} else {
 		data = append(data, "null"...)
 	}
-	data = appendJSONString(append(data, `,"url":`...), issueURL)
-	data = appendJSONString(append(data, `,"repository_url":`...), repositoryURL)
-	data = appendJSONString(append(data, `,"comments_url":`...), issueURL+"/comments")
-	data = appendJSONString(append(data, `,"labels_url":`...), issueURL+"/labels{/name}")
-	data = appendJSONString(append(data, `,"html_url":`...), "/"+repo.owner+"/"+repo.name+"/issues/"+number)
+	if repo.urlSafe {
+		var numberBuf [20]byte
+		number := strconv.AppendInt(numberBuf[:0], int64(item.number), 10)
+		data = append(data, `,"url":"`...)
+		data = append(data, repo.issueBase...)
+		data = append(data, number...)
+		data = append(data, `","repository_url":"`...)
+		data = append(data, repo.urlBase...)
+		data = append(data, `","comments_url":"`...)
+		data = append(data, repo.issueBase...)
+		data = append(data, number...)
+		data = append(data, `/comments","labels_url":"`...)
+		data = append(data, repo.issueBase...)
+		data = append(data, number...)
+		data = append(data, `/labels{/name}","html_url":"`...)
+		data = append(data, repo.htmlBase...)
+		data = append(data, number...)
+		data = append(data, '"')
+	} else {
+		number := strconv.Itoa(item.number)
+		repositoryURL := repo.urlBase
+		issueURL := repo.issueBase + number
+		data = appendJSONString(append(data, `,"url":`...), issueURL)
+		data = appendJSONString(append(data, `,"repository_url":`...), repositoryURL)
+		data = appendJSONString(append(data, `,"comments_url":`...), issueURL+"/comments")
+		data = appendJSONString(append(data, `,"labels_url":`...), issueURL+"/labels{/name}")
+		data = appendJSONString(append(data, `,"html_url":`...), repo.htmlBase+number)
+	}
 	item.cached = append(data, `,"author_association":"OWNER"}`...)
 }
 
@@ -163,16 +185,196 @@ type issueInput struct {
 
 var issueInputs = sync.Pool{New: func() any { return new(issueInput) }}
 
+// tryDecodeIssue is a fast path that fills input exactly like
+// encoding/json.Unmarshal would for a plain JSON object with only the keys
+// title/body/labels and unescaped, valid-UTF-8 string values. On anything
+// unusual (escapes, other keys, other value types, invalid UTF-8, trailing
+// garbage) it reports false and the caller falls back to encoding/json,
+// so accepted input semantics never change. Values are only written to
+// input on success.
+func tryDecodeIssue(data []byte, input *issueInput) bool {
+	var title, body string
+	var labels []any
+	hasTitle, hasBody, hasLabels := false, false, false
+	pos := 0
+	skip := func() {
+		for pos < len(data) && (data[pos] == ' ' || data[pos] == '\t' || data[pos] == '\n' || data[pos] == '\r') {
+			pos++
+		}
+	}
+	quoted := func() (string, bool) {
+		if pos >= len(data) || data[pos] != '"' {
+			return "", false
+		}
+		pos++
+		start := pos
+		for pos < len(data) && data[pos] != '"' {
+			if data[pos] == '\\' || data[pos] < 32 {
+				return "", false
+			}
+			pos++
+		}
+		if pos >= len(data) {
+			return "", false
+		}
+		value := data[start:pos]
+		pos++
+		if !utf8.Valid(value) {
+			return "", false
+		}
+		return string(value), true
+	}
+	skip()
+	if pos >= len(data) || data[pos] != '{' {
+		return false
+	}
+	pos++
+	skip()
+	if pos < len(data) && data[pos] == '}' {
+		pos++
+		skip()
+		if pos != len(data) {
+			return false
+		}
+		if hasTitle {
+			input.Title = title
+		}
+		if hasBody {
+			input.Body = body
+		}
+		if hasLabels {
+			input.Labels = labels
+		}
+		return true
+	}
+	for {
+		key, ok := quoted()
+		if !ok {
+			return false
+		}
+		skip()
+		if pos >= len(data) || data[pos] != ':' {
+			return false
+		}
+		pos++
+		skip()
+		switch key {
+		case "title", "body":
+			value, ok := quoted()
+			if !ok {
+				return false
+			}
+			if key == "title" {
+				title = value
+				hasTitle = true
+			} else {
+				body = value
+				hasBody = true
+			}
+		case "labels":
+			if pos >= len(data) || data[pos] != '[' {
+				return false
+			}
+			pos++
+			skip()
+			list := []any{}
+			if pos < len(data) && data[pos] != ']' {
+				for {
+					value, ok := quoted()
+					if !ok {
+						return false
+					}
+					list = append(list, value)
+					skip()
+					if pos < len(data) && data[pos] == ',' {
+						pos++
+						skip()
+						continue
+					}
+					break
+				}
+			}
+			if pos >= len(data) || data[pos] != ']' {
+				return false
+			}
+			pos++
+			labels = list
+			hasLabels = true
+		default:
+			return false
+		}
+		skip()
+		if pos < len(data) && data[pos] == ',' {
+			pos++
+			skip()
+			continue
+		}
+		break
+	}
+	if pos >= len(data) || data[pos] != '}' {
+		return false
+	}
+	pos++
+	skip()
+	if pos != len(data) {
+		return false
+	}
+	if hasTitle {
+		input.Title = title
+	}
+	if hasBody {
+		input.Body = body
+	}
+	if hasLabels {
+		input.Labels = labels
+	}
+	return true
+}
+
+// readBody reads up to 16MB+1 from req.Body without per-call wrapper
+// allocations (no io.LimitReader struct, no ReadAll growth copies).
+// Returns ok=false on read error. The caller keeps the len > 16MB check.
+func readBody(req *http.Request) ([]byte, bool) {
+	const maxBody = int64(16<<20) + 1
+	size := 512
+	if req.ContentLength > 0 && req.ContentLength < int64(size) {
+		size = int(req.ContentLength)
+	}
+	data := make([]byte, 0, size)
+	for int64(len(data)) < maxBody {
+		if len(data) == cap(data) {
+			grown := append(data, 0)
+			data = grown[:len(grown)-1]
+		}
+		end := cap(data)
+		if int64(end) > maxBody {
+			end = int(maxBody)
+		}
+		read, err := req.Body.Read(data[len(data):end])
+		data = data[:len(data)+read]
+		if err != nil {
+			return data, err == io.EOF
+		}
+	}
+	return data, true
+}
+
 func (f *forge) createIssueHTTP(out http.ResponseWriter, req *http.Request, owner, name string) {
 	input := issueInputs.Get().(*issueInput)
 	defer func() {
 		*input = issueInput{}
 		issueInputs.Put(input)
 	}()
-	data, err := io.ReadAll(io.LimitReader(req.Body, (16<<20)+1))
-	if err != nil || len(data) > 16<<20 || (len(data) > 0 && (json.Unmarshal(data, input) != nil || strings.TrimSpace(string(data)) == "null")) {
+	data, ok := readBody(req)
+	if !ok || len(data) > 16<<20 {
 		problem(out, 400, "Problems parsing JSON")
 		return
+	}
+	if len(data) > 0 && !tryDecodeIssue(data, input) {
+		if json.Unmarshal(data, input) != nil || bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+			problem(out, 400, "Problems parsing JSON")
+			return
+		}
 	}
 	repo := f.repo(owner, name)
 	if repo == nil {
