@@ -21,13 +21,14 @@ var kinds = [...]string{"", "commit", "tree", "blob", "tag"}
 var badPack = errors.New("invalid packfile")
 
 type object struct {
-	kind       byte
-	data       []byte
-	compressed []byte
-	parents    []string
-	target     string
-	entries    []treeEntry
-	message    string
+	kind         byte
+	data         []byte
+	compressed   []byte
+	compressOnce sync.Once
+	parents      []string
+	target       string
+	entries      []treeEntry
+	message      string
 }
 type treeEntry struct{ mode, name, oid string }
 type objects map[string]*object
@@ -240,6 +241,10 @@ var readers sync.Pool
 var compressors = sync.Pool{New: func() any { writer, _ := zlib.NewWriterLevel(io.Discard, zlib.BestSpeed); return writer }}
 
 func readPack(raw []byte, existing objects) (objects, error) {
+	return readPackLookup(raw, func(oid string) *object { return existing[oid] })
+}
+
+func readPackLookup(raw []byte, existing func(string) *object) (objects, error) {
 	if len(raw) < 32 || string(raw[:4]) != "PACK" {
 		return nil, badPack
 	}
@@ -364,7 +369,7 @@ func readPack(raw []byte, existing objects) (objects, error) {
 			if entry.baseID != "" {
 				base = output[entry.baseID]
 				if base == nil {
-					base = existing[entry.baseID]
+					base = existing(entry.baseID)
 				}
 			} else {
 				base = offsets[entry.baseOffset].obj
@@ -459,16 +464,19 @@ func simpleDelta(base, data []byte) []byte {
 }
 
 func writePack(list []*object, deltas bool) []byte {
-	var out = []byte("PACK\x00\x00\x00\x02")
+	out := make([]byte, 0, 32+len(list)*128)
+	out = append(out, "PACK\x00\x00\x00\x02"...)
 	out = binary.BigEndian.AppendUint32(out, uint32(len(list)))
 	var previous [5]*object
 	var offsets [5]int
 	for _, obj := range list {
 		start := len(out)
+		obj.compressOnce.Do(func() {
+			if obj.compressed == nil {
+				obj.compressed = deflate(obj.data)
+			}
+		})
 		compressed := obj.compressed
-		if compressed == nil {
-			compressed = deflate(obj.data)
-		}
 		header := packHeader(obj.kind, len(obj.data))
 		var offset []byte
 		if base := previous[obj.kind]; deltas && base != nil && len(obj.data) < 1<<20 {

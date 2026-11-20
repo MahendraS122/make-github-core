@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,6 +39,11 @@ type repository struct {
 	objects                          objects
 	refs                             map[string]string
 	issues                           map[int]*issue
+	issueOrder                       []*issue
+	issueLists                       sync.Map
+	openIssues                       int
+	cached                           []byte
+	repoPrefix, repoSuffix           []byte
 	pulls                            map[int]*pull
 	labels                           map[string]record
 	nextNumber                       int
@@ -69,6 +75,7 @@ func jsonReply(out http.ResponseWriter, status int, value any) {
 }
 func jsonBytes(out http.ResponseWriter, status int, data []byte) {
 	out.Header().Set("Content-Type", "application/json")
+	out.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	out.WriteHeader(status)
 	out.Write(data)
 }
@@ -186,6 +193,7 @@ func (f *forge) commit(r *repository, tree string, parents []string, message str
 	return r.objects.put(1, []byte(data.String()))
 }
 func main() {
+	runtime.GOMAXPROCS(2)
 	base := strings.TrimRight(os.Getenv("MAKEFUN_ENV_URL"), "/")
 	if base == "" {
 		log.Fatal("MAKEFUN_ENV_URL is required")

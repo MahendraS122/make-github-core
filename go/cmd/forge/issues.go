@@ -2,10 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"unicode/utf8"
 )
 
 type issue struct {
@@ -15,6 +18,7 @@ type issue struct {
 	labels             []record
 	comments           []record
 	cached             []byte
+	cachedState        string
 }
 
 func (repo *repository) issueList(state string, ascending bool) []*issue {
@@ -22,12 +26,12 @@ func (repo *repository) issueList(state string, ascending bool) []*issue {
 		state = "open"
 	}
 	list := make([]*issue, 0, len(repo.issues))
-	for index := 1; index <= repo.nextNumber; index++ {
-		number := index
+	for index := 0; index < len(repo.issueOrder); index++ {
+		position := index
 		if !ascending {
-			number = repo.nextNumber + 1 - index
+			position = len(repo.issueOrder) - 1 - index
 		}
-		if item := repo.issues[number]; item != nil && (state == "all" || item.state == state) {
+		if item := repo.issueOrder[position]; state == "all" || item.state == state {
 			list = append(list, item)
 		}
 	}
@@ -65,39 +69,170 @@ func issueLabels(repo *repository, value any) ([]record, *fault) {
 	return result, nil
 }
 func (f *forge) newIssue(repo *repository, input record) (*issue, *fault) {
-	title := str(input, "title")
+	return f.newIssueValues(repo, str(input, "title"), str(input, "body"), input["labels"])
+}
+func (f *forge) newIssueValues(repo *repository, title, body string, labelInput any) (*issue, *fault) {
 	if strings.TrimSpace(title) == "" {
 		return nil, fail(422, "Title is required")
 	}
 	if !repo.hasIssues {
 		return nil, fail(410, "Issues are disabled")
 	}
-	labels, err := issueLabels(repo, input["labels"])
+	labels, err := issueLabels(repo, labelInput)
 	if err != nil {
 		return nil, err
 	}
 	repo.nextNumber++
-	item := &issue{id: f.ids.Add(1), number: repo.nextNumber, title: title, body: str(input, "body"), state: "open", labels: labels, comments: []record{}}
+	item := &issue{id: f.ids.Add(1), number: repo.nextNumber, title: title, body: body, state: "open", labels: labels, comments: []record{}}
 	repo.issues[item.number] = item
+	repo.issueOrder = append(repo.issueOrder, item)
 	f.cacheIssue(repo, item)
 	return item, nil
 }
 func (f *forge) cacheIssue(repo *repository, item *issue) {
+	if item.cachedState != item.state {
+		if item.cachedState == "open" {
+			repo.openIssues--
+		}
+		if item.state == "open" {
+			repo.openIssues++
+		}
+		item.cachedState = item.state
+		repo.cacheOpenIssues()
+	}
+	repo.issueLists.Clear()
 	number := strconv.Itoa(item.number)
 	repositoryURL := repoURL(repo)
 	issueURL := repositoryURL + "/issues/" + number
-	var closedAt *string
-	if item.state == "closed" {
-		closedAt = &f.timestamp
+	data := make([]byte, 0, 1024+len(item.title)+len(item.body)+len(repositoryURL)*5)
+	data = strconv.AppendInt(append(data, `{"id":`...), item.id, 10)
+	data = append(data, `,"node_id":`...)
+	data = appendJSONString(data, node("Issue", item.id))
+	data = strconv.AppendInt(append(data, `,"number":`...), int64(item.number), 10)
+	data = appendJSONString(append(data, `,"title":`...), item.title)
+	data = appendJSONString(append(data, `,"body":`...), item.body)
+	data = appendJSONString(append(data, `,"state":`...), item.state)
+	data = append(append(data, `,"user":`...), f.viewerJSON...)
+	data = append(data, `,"labels":`...)
+	if len(item.labels) == 0 {
+		data = append(data, "[]"...)
+	} else {
+		labels, _ := json.Marshal(item.labels)
+		data = append(data, labels...)
 	}
-	item.cached, _ = json.Marshal(issueJSON{
-		ID: item.id, NodeID: node("Issue", item.id), Number: item.number, Title: item.title,
-		Body: item.body, State: item.state, User: f.viewerJSON, Labels: item.labels,
-		Assignees: []record{}, Comments: len(item.comments), CreatedAt: f.timestamp,
-		UpdatedAt: f.timestamp, ClosedAt: closedAt, URL: issueURL, RepositoryURL: repositoryURL,
-		CommentsURL: issueURL + "/comments", LabelsURL: issueURL + "/labels{/name}",
-		HTMLURL: "/" + repo.owner + "/" + repo.name + "/issues/" + number, AuthorAssociation: "OWNER",
+	data = append(data, `,"assignees":[],"assignee":null,"milestone":null,"locked":false,"comments":`...)
+	data = strconv.AppendInt(data, int64(len(item.comments)), 10)
+	data = appendJSONString(append(data, `,"created_at":`...), f.timestamp)
+	data = appendJSONString(append(data, `,"updated_at":`...), f.timestamp)
+	data = append(data, `,"closed_at":`...)
+	if item.state == "closed" {
+		data = appendJSONString(data, f.timestamp)
+	} else {
+		data = append(data, "null"...)
+	}
+	data = appendJSONString(append(data, `,"url":`...), issueURL)
+	data = appendJSONString(append(data, `,"repository_url":`...), repositoryURL)
+	data = appendJSONString(append(data, `,"comments_url":`...), issueURL+"/comments")
+	data = appendJSONString(append(data, `,"labels_url":`...), issueURL+"/labels{/name}")
+	data = appendJSONString(append(data, `,"html_url":`...), "/"+repo.owner+"/"+repo.name+"/issues/"+number)
+	item.cached = append(data, `,"author_association":"OWNER"}`...)
+}
+
+func appendJSONString(data []byte, value string) []byte {
+	for index := 0; index < len(value); index++ {
+		char := value[index]
+		if char < 32 || char == '"' || char == '\\' || char == '<' || char == '>' || char == '&' || char >= utf8.RuneSelf {
+			encoded, _ := json.Marshal(value)
+			return append(data, encoded...)
+		}
+	}
+	return append(append(append(data, '"'), value...), '"')
+}
+
+type issueListCache struct {
+	once sync.Once
+	body []byte
+	next string
+}
+
+type issueInput struct {
+	Title  any `json:"title"`
+	Body   any `json:"body"`
+	Labels any `json:"labels"`
+}
+
+var issueInputs = sync.Pool{New: func() any { return new(issueInput) }}
+
+func (f *forge) createIssueHTTP(out http.ResponseWriter, req *http.Request, owner, name string) {
+	input := issueInputs.Get().(*issueInput)
+	defer func() {
+		*input = issueInput{}
+		issueInputs.Put(input)
+	}()
+	data, err := io.ReadAll(io.LimitReader(req.Body, (16<<20)+1))
+	if err != nil || len(data) > 16<<20 || (len(data) > 0 && (json.Unmarshal(data, input) != nil || strings.TrimSpace(string(data)) == "null")) {
+		problem(out, 400, "Problems parsing JSON")
+		return
+	}
+	repo := f.repo(owner, name)
+	if repo == nil {
+		missing(out)
+		return
+	}
+	repo.guard.Lock()
+	item, failure := f.newIssueValues(repo, text(input.Title), text(input.Body), input.Labels)
+	var body []byte
+	if failure == nil {
+		body = item.cached
+	}
+	repo.guard.Unlock()
+	if failure != nil {
+		problem(out, failure.status, failure.message)
+	} else {
+		jsonBytes(out, 201, body)
+	}
+}
+
+func (repo *repository) cachedIssueList(req *http.Request) *issueListCache {
+	shape := req.URL.RawQuery
+	value, ok := repo.issueLists.Load(shape)
+	if !ok {
+		value, _ = repo.issueLists.LoadOrStore(shape, &issueListCache{})
+	}
+	cached := value.(*issueListCache)
+	cached.once.Do(func() {
+		query := req.URL.Query()
+		size := integer(query.Get("per_page"))
+		if size <= 0 {
+			size = 30
+		}
+		size = min(size, 100)
+		page := max(1, integer(query.Get("page")))
+		list := repo.issueList(query.Get("state"), query.Get("direction") == "asc")
+		start, end := 0, 0
+		if page <= len(list)/size+1 {
+			start = (page - 1) * size
+			end = min(start+size, len(list))
+		}
+		if end < len(list) && end > start {
+			query.Set("page", strconv.Itoa(page+1))
+			cached.next = query.Encode()
+		}
+		capacity := 2
+		for _, item := range list[start:end] {
+			capacity += len(item.cached) + 1
+		}
+		body := make([]byte, 1, capacity)
+		body[0] = '['
+		for index, item := range list[start:end] {
+			if index > 0 {
+				body = append(body, ',')
+			}
+			body = append(body, item.cached...)
+		}
+		cached.body = append(body, ']')
 	})
+	return cached
 }
 
 type issueJSON struct {
@@ -150,16 +285,11 @@ func (f *forge) restIssues(out http.ResponseWriter, req *http.Request, repo *rep
 			return
 		}
 		if req.Method == "GET" {
-			query := req.URL.Query()
-			list := paginate(out, req, repo.issueList(query.Get("state"), query.Get("direction") == "asc"), 30)
-			body := []byte{'['}
-			for index, item := range list {
-				if index > 0 {
-					body = append(body, ',')
-				}
-				body = append(body, item.cached...)
+			cached := repo.cachedIssueList(req)
+			if cached.next != "" {
+				out.Header().Set("Link", "<http://"+req.Host+req.URL.EscapedPath()+"?"+cached.next+">; rel=\"next\"")
 			}
-			jsonBytes(out, 200, append(body, ']'))
+			jsonBytes(out, 200, cached.body)
 			return
 		}
 	case 1, 2:

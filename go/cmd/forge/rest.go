@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -47,7 +48,26 @@ func (f *forge) repoView(repo *repository) record {
 	if repo.owner != f.login {
 		owner["type"] = "Organization"
 	}
-	return record{"id": repo.id, "node_id": node("Repository", repo.id), "name": repo.name, "full_name": full, "owner": owner, "private": repo.private, "description": repo.description, "default_branch": repo.branch, "has_issues": repo.hasIssues, "has_projects": true, "has_wiki": true, "fork": false, "archived": false, "disabled": false, "url": path, "html_url": "/" + full, "clone_url": "/" + full + ".git", "git_url": "/" + full + ".git", "ssh_url": "git@localhost:" + full + ".git", "created_at": f.timestamp, "updated_at": f.timestamp, "pushed_at": f.timestamp, "permissions": record{"admin": true, "push": true, "pull": true}, "issues_url": path + "/issues{/number}", "pulls_url": path + "/pulls{/number}", "contents_url": path + "/contents/{+path}", "open_issues_count": len(repo.issueList("open", false)), "visibility": map[bool]string{true: "private", false: "public"}[repo.private]}
+	return record{"id": repo.id, "node_id": node("Repository", repo.id), "name": repo.name, "full_name": full, "owner": owner, "private": repo.private, "description": repo.description, "default_branch": repo.branch, "has_issues": repo.hasIssues, "has_projects": true, "has_wiki": true, "fork": false, "archived": false, "disabled": false, "url": path, "html_url": "/" + full, "clone_url": "/" + full + ".git", "git_url": "/" + full + ".git", "ssh_url": "git@localhost:" + full + ".git", "created_at": f.timestamp, "updated_at": f.timestamp, "pushed_at": f.timestamp, "permissions": record{"admin": true, "push": true, "pull": true}, "issues_url": path + "/issues{/number}", "pulls_url": path + "/pulls{/number}", "contents_url": path + "/contents/{+path}", "open_issues_count": repo.openIssues, "visibility": map[bool]string{true: "private", false: "public"}[repo.private]}
+}
+func (f *forge) cacheRepo(repo *repository) {
+	repo.cached, _ = json.Marshal(f.repoView(repo))
+	marker := []byte(`"open_issues_count":`)
+	start := bytes.Index(repo.cached, marker) + len(marker)
+	end := start
+	for end < len(repo.cached) && repo.cached[end] >= '0' && repo.cached[end] <= '9' {
+		end++
+	}
+	repo.repoPrefix, repo.repoSuffix = repo.cached[:start], repo.cached[end:]
+}
+func (repo *repository) cacheOpenIssues() {
+	if repo.repoPrefix == nil {
+		return
+	}
+	data := make([]byte, 0, len(repo.repoPrefix)+len(repo.repoSuffix)+20)
+	data = append(data, repo.repoPrefix...)
+	data = strconv.AppendInt(data, int64(repo.openIssues), 10)
+	repo.cached = append(data, repo.repoSuffix...)
 }
 func (f *forge) createRepo(owner string, input record) (*repository, *fault) {
 	name := str(input, "name")
@@ -66,6 +86,7 @@ func (f *forge) createRepo(owner string, input record) (*repository, *fault) {
 		tree := repo.objects.makeTree(map[string]treeEntry{"README.md": {"100644", "README.md", blob}})
 		repo.refs[repo.head()] = f.commit(repo, tree, nil, "Initial commit")
 	}
+	f.cacheRepo(repo)
 	f.repos[lookup] = repo
 	if owner != f.login {
 		f.owners[owner] = true
@@ -122,7 +143,14 @@ func organization(owner string) record {
 }
 func (f *forge) rest(out http.ResponseWriter, req *http.Request, path string) {
 	method := req.Method
+	if method == "GET" && f.cachedGet(out, req, path) {
+		return
+	}
 	parts := strings.Split(path, "/")
+	if method == "POST" && len(parts) == 4 && parts[0] == "repos" && parts[3] == "issues" {
+		f.createIssueHTTP(out, req, parts[1], parts[2])
+		return
+	}
 	var input record
 	if method == "POST" || method == "PATCH" || method == "PUT" || method == "DELETE" {
 		var ok bool
@@ -167,9 +195,9 @@ func (f *forge) rest(out http.ResponseWriter, req *http.Request, path string) {
 				return
 			}
 			repo.guard.RLock()
-			view := f.repoView(repo)
+			view := repo.cached
 			repo.guard.RUnlock()
-			jsonReply(out, 201, view)
+			jsonBytes(out, 201, view)
 			return
 		}
 		if method == "GET" {
@@ -180,13 +208,17 @@ func (f *forge) rest(out http.ResponseWriter, req *http.Request, path string) {
 					list = list[1:]
 				}
 			}
-			views := []record{}
+			views := make([]byte, 1, 1024)
+			views[0] = '['
 			for _, repo := range paginate(out, req, list, 30) {
+				if len(views) > 1 {
+					views = append(views, ',')
+				}
 				repo.guard.RLock()
-				views = append(views, f.repoView(repo))
+				views = append(views, repo.cached...)
 				repo.guard.RUnlock()
 			}
-			jsonReply(out, 200, views)
+			jsonBytes(out, 200, append(views, ']'))
 			return
 		}
 	}
@@ -253,11 +285,12 @@ func (f *forge) rest(out http.ResponseWriter, req *http.Request, path string) {
 				repo.branch = branch
 				repo.changed()
 			}
+			f.cacheRepo(repo)
 		} else if method != "GET" {
 			missing(out)
 			return
 		}
-		jsonReply(out, 200, f.repoView(repo))
+		jsonBytes(out, 200, repo.cached)
 		return
 	}
 	resource := parts[3]
@@ -357,6 +390,50 @@ func (f *forge) rest(out http.ResponseWriter, req *http.Request, path string) {
 		return
 	}
 	missing(out)
+}
+
+func (f *forge) cachedGet(out http.ResponseWriter, req *http.Request, path string) bool {
+	path, ok := strings.CutPrefix(path, "repos/")
+	if !ok {
+		return false
+	}
+	owner, path, ok := strings.Cut(path, "/")
+	if !ok {
+		return false
+	}
+	name, tail, _ := strings.Cut(path, "/")
+	if tail != "" && tail != "issues" && (!strings.HasPrefix(tail, "issues/") || strings.Contains(tail[7:], "/")) {
+		return false
+	}
+	repo := f.repo(owner, name)
+	if repo == nil {
+		missing(out)
+		return true
+	}
+	repo.guard.RLock()
+	var body []byte
+	var next string
+	switch tail {
+	case "":
+		body = repo.cached
+	case "issues":
+		cached := repo.cachedIssueList(req)
+		body, next = cached.body, cached.next
+	default:
+		if item := repo.issues[integer(tail[7:])]; item != nil {
+			body = item.cached
+		}
+	}
+	repo.guard.RUnlock()
+	if body == nil {
+		missing(out)
+	} else {
+		if next != "" {
+			out.Header().Set("Link", "<http://"+req.Host+req.URL.EscapedPath()+"?"+next+">; rel=\"next\"")
+		}
+		jsonBytes(out, 200, body)
+	}
+	return true
 }
 func branchView(repo *repository, branch, oid string) record {
 	return record{"name": branch, "protected": false, "commit": record{"sha": oid, "url": repoURL(repo) + "/commits/" + oid}, "protection": record{"enabled": false}}

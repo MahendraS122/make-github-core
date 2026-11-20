@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const upload = "git-upload-pack"
@@ -150,9 +151,7 @@ func (f *forge) gitHTTP(out http.ResponseWriter, req *http.Request, parts []stri
 	}
 	var response []byte
 	if path == receive {
-		repo.guard.Lock()
 		response = repo.receive(body)
-		repo.guard.Unlock()
 	} else {
 		repo.guard.RLock()
 		response = repo.upload(body, v2)
@@ -207,7 +206,13 @@ func (repo *repository) receive(body []byte) []byte {
 		commands = append(commands, update{parts[0], parts[1], parts[2]})
 	}
 	if unpack == "ok" && len(body) > 0 {
-		incoming, err := readPack(body, repo.objects)
+		incoming, err := readPackLookup(body, func(oid string) *object {
+			repo.guard.RLock()
+			obj := repo.objects[oid]
+			repo.guard.RUnlock()
+			return obj
+		})
+		repo.guard.Lock()
 		if err != nil {
 			unpack = err.Error()
 		} else {
@@ -217,7 +222,10 @@ func (repo *repository) receive(body []byte) []byte {
 				}
 			}
 		}
+	} else {
+		repo.guard.Lock()
 	}
+	defer repo.guard.Unlock()
 	response = packet(response, "unpack "+unpack+"\n")
 	for _, command := range commands {
 		current := repo.refs[command.ref]
@@ -262,20 +270,32 @@ func (repo *repository) receive(body []byte) []byte {
 	return response
 }
 
+type packResponse struct {
+	once sync.Once
+	data []byte
+}
+
 func (repo *repository) upload(body []byte, v2 bool) []byte {
 	first, _, _ := unpackLine(body)
 	v2 = v2 || strings.HasPrefix(first, "command=")
 	cacheable := len(body) < 1024 && bytes.Contains(body, []byte("done")) && !bytes.Contains(body, []byte("have "))
-	cacheKey := ""
 	if cacheable {
-		cacheKey = string(body)
+		cacheKey := string(body)
 		if v2 {
 			cacheKey = "v2:" + cacheKey
 		}
-		if cached, ok := repo.packCache.Load(cacheKey); ok {
-			return cached.([]byte)
+		cached, ok := repo.packCache.Load(cacheKey)
+		if !ok {
+			cached, _ = repo.packCache.LoadOrStore(cacheKey, &packResponse{})
 		}
+		response := cached.(*packResponse)
+		response.once.Do(func() { response.data = repo.buildUpload(body, v2) })
+		return response.data
 	}
+	return repo.buildUpload(body, v2)
+}
+
+func (repo *repository) buildUpload(body []byte, v2 bool) []byte {
 	var wants, haves, prefixes []string
 	shallow := map[string]bool{}
 	depth := 0
@@ -492,9 +512,6 @@ func (repo *repository) upload(body []byte, v2 bool) []byte {
 		response = append(sideband(response, pack), "0000"...)
 	} else {
 		response = append(response, pack...)
-	}
-	if cacheable && len(response) < 2<<20 {
-		repo.packCache.Store(cacheKey, response)
 	}
 	return response
 }

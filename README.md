@@ -20,3 +20,32 @@ node --experimental-strip-types main.ts
 ```
 
 Running the launcher requires a trial or local stub exposing `/register` and `/done`. Set `MAKEFUN_DONE_URL` to override the completion endpoint.
+
+## Performance checks
+
+The subprocess benchmark starts the forge with deterministic fake credentials and a local
+`/register` and `/done` stub. It measures sequential HTTP/1.1 keep-alive reads and creates,
+three rounds of 200 real receive-pack pushes (including timings for the first three), and
+cold concurrent depth-one fetches of a 200-commit repository. Fetch packs are decoded and
+their checksums verified outside the timed interval.
+
+```sh
+GOMAXPROCS=2 FORGE_PERF=1 FORGE_PERF_ENFORCE=1 go test ./go/cmd/forge -run '^TestPerformance$' -count=1 -v
+go test -race ./go/...
+go test ./go/cmd/forge -run '^$' -bench BenchmarkCachedIssueList -benchmem
+```
+
+`FORGE_TEST_BINARY=/absolute/path/to/forge` benchmarks an existing binary instead of the
+test subprocess. To run the unmodified external SDK suite, set
+`FORGE_CONFORMANCE_RUNNER=/absolute/path/to/sdk/run.ts` and run
+`go test ./go/cmd/forge -run '^TestExternalConformance$' -count=1 -v`.
+Set `FORGE_PERF=1` to include its performance workloads, and
+`FORGE_CONFORMANCE_OUTPUT=/tmp/forge-conformance.json` to retain its JSON report.
+The SDK must reside under a Node package with `"type":"module"`.
+
+Issue and repository responses are encoded when changed. Issue-list pages are cached by
+repository and raw query shape and invalidated by every issue/comment mutation. Concurrent
+identical fetches share one pack build; immutable object compression is reused across fetch
+shapes. Receive-pack inflates objects before acquiring the repository write lock, looking up
+external delta bases with short read locks. HTTP read/write timeouts remain disabled,
+keep-alive stays enabled, and the server caps headers at 64 KiB.
