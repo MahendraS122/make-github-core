@@ -278,7 +278,7 @@ type packResponse struct {
 func (repo *repository) upload(body []byte, v2 bool) []byte {
 	first, _, _ := unpackLine(body)
 	v2 = v2 || strings.HasPrefix(first, "command=")
-	cacheable := len(body) < 1024 && bytes.Contains(body, []byte("done")) && !bytes.Contains(body, []byte("have "))
+	cacheable := len(body) < 1024 && ((bytes.Contains(body, []byte("done")) && !bytes.Contains(body, []byte("have "))) || first == "command=ls-refs\n")
 	if cacheable {
 		cacheKey := string(body)
 		if v2 {
